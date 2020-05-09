@@ -1,0 +1,27 @@
+[package]
+name = "c4dart"
+version = "0.1.0"
+authors = ["K. <kayo@illumium.org>"]
+edition = "2018"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies.clang]
+version = "^0.23"
+features = ["clang_7_0"]
+
+[dependencies.regex]
+version = "^1"
+
+[dependencies.structopt]
+version = "^0.3"
+features = ["paw"]
+
+[dependencies.paw]
+version = "^1"
+
+[dependencies.log]
+version = "^0.4"
+
+[dependencies.pretty_env_logger]
+version = "^0.4"
