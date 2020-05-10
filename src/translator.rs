@@ -5,11 +5,78 @@ use log::*;
 use crate::{Options, Coder};
 
 #[derive(Debug, Clone)]
+pub struct FuncDef {
+    name: Option<String>,
+    cmt: Option<String>,
+    cffi: String,
+    dart: String,
+}
+
+impl<'a> From<Entity<'a>> for FuncDef {
+    fn from(entity: Entity) -> Self {
+        let res = entity.get_result_type();
+        let args = entity.get_arguments();
+
+        let cffi_res = res.map(|type_| translate_type(type_, true))
+            .unwrap_or("Void".into());
+        let dart_res = res.map(|type_| translate_type(type_, false))
+            .unwrap_or("void".into());
+
+        let cffi_args = args.as_ref().map(|args| translate_args(args.clone(), true))
+            .unwrap_or("".into());
+        let dart_args = args.map(|args| translate_args(args, false))
+            .unwrap_or("".into());
+        
+        Self {
+            name: entity.get_name(),
+            cmt: entity.get_comment(),
+            cffi: format!("{res} Function({args})",
+                          res = cffi_res,
+                          args = cffi_args),
+            dart: format!("{res} Function({args})",
+                          res = dart_res,
+                          args = dart_args),
+        }
+    }
+}
+
+impl<'a> From<Type<'a>> for FuncDef {
+    fn from(type_: Type<'a>) -> Self {
+        let res = type_.get_result_type();
+        let args = type_.get_argument_types();
+
+        let cffi_res = res.map(|type_| translate_type(type_, true))
+            .unwrap_or("Void".into());
+        let dart_res = res.map(|type_| translate_type(type_, false))
+            .unwrap_or("void".into());
+
+        let cffi_args = args.as_ref().map(|args| translate_types(args.clone(), true))
+            .unwrap_or("".into());
+        let dart_args = args.map(|args| translate_types(args, false))
+            .unwrap_or("".into());
+        
+        Self {
+            name: None,
+            cmt: None,
+            cffi: format!("{res} Function({args})",
+                          res = cffi_res,
+                          args = cffi_args),
+            dart: format!("{res} Function({args})",
+                          res = dart_res,
+                          args = dart_args),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct Translator {
     options: Options,
+
     exported: HashSet<String>,
-    funcs: HashMap<String, String>,
-    func_types: HashMap<String, String>,
+    
+    calls: HashMap<String, FuncDef>,
+    callbacks: HashMap<String, FuncDef>,
+    
     coder: Coder,
 }
 
@@ -18,75 +85,178 @@ impl Translator {
         Self {
             options,
             exported: HashSet::default(),
-            funcs: HashMap::default(),
-            func_types: HashMap::default(),
+            calls: HashMap::default(),
+            callbacks: HashMap::default(),
             coder: Coder::default(),
         }
     }
     
     pub fn translate(&mut self, entity: Entity) {
+        use EntityKind::*;
+        
         self.coder.line("import 'dart:ffi';");
         self.coder.line("");
-        
-        for entity in entity.get_children() {
-            use EntityKind::*;
 
+        for entity in entity.get_children() {
+            if let Some(name) = entity.get_name() {
+                if self.match_name(&name) {
+                    match entity.get_kind() {
+                        FunctionDecl => self.parse_function(&name, entity),
+                        _ => {},
+                    }
+                }
+            }
+        }
+
+        for entity in entity.get_children() {
             if let Some(name) = entity.get_name() {
                 if self.match_name(&name) {
                     let xname = self.make_name(&name);
-                    if self.export_once(&xname) {
+                    if self.export_once(&name) {
                         match entity.get_kind() {
                             EnumDecl => self.translate_enum(&name, &xname, entity),
-                            StructDecl => self.translate_struct(&name, &xname, entity),
-                            TypedefDecl => self.translate_typedef(&name, &xname, entity),
-                            FunctionDecl => self.translate_function(&name, &xname, entity),
-                            _ => warn!("Untranslated entity: {:?}", entity),
+                            _ => {},
                         }
                     }
                 }
             }
         }
-    }
-
-    pub fn make_class(&mut self, class: impl AsRef<str>) {
-        let class = class.as_ref();
-        let funcs = &self.funcs;
-        let func_types = &self.func_types;
-
+        
         self.coder.comment("Library class");
+
+        let class = &self.options.class_name;
+        let calls = &self.calls;
+        let callbacks = &self.callbacks;
+        
         self.coder.block(format!("class {name}", name = class), |coder| {
-            coder.comment("Functions");
-            for (_, xname) in funcs {
-                coder.line(format!("final {name} _{name};", name = xname));
-            }
             coder.comment("Callbacks");
-            for (_, xname) in func_types {
-                coder.line(format!("final {name}_ _{name};", name = xname));
+
+            for (name, func) in callbacks {
+                if let Some(cmt) = &func.cmt {
+                    coder.comment(cmt);
+                }
+                coder.line(format!("final Pointer<NativeFunction<{type}>> _{name};",
+                                   type = func.cffi,
+                                   name = name));
+            }
+            
+            coder.comment("Functions");
+
+            for (name, func) in calls {
+                if let Some(cmt) = &func.cmt {
+                    coder.comment(cmt);
+                }
+                coder.line(format!("final {type} _{name};",
+                                   type = func.dart,
+                                   name = name));
             }
 
+            coder.comment("Constructor");
             coder.line(format!("{name}(", name = class));
             coder.line("    DynamicLibrary dylib");
-            for (_, xname) in func_types {
-                coder.line(format!("  , {name} {name}_", name = xname));
+            
+            for (name, func) in callbacks {
+                coder.line(format!("  , {type} {name}_",
+                                   type = func.dart,
+                                   name = name));
             }
+            
             coder.line(")");
 
             let mut initial = true;
 
-            coder.comment("Init functions");
-            for (_, xname) in funcs {
-                coder.line(format!("{sep} _{name} = dylib.lookup<NativeFunction<{name}>>('{name}').asFunction()",
-                                   name = xname, sep = if initial { ':' } else { ',' }));
-                if initial { initial = false; }
-            }
             coder.comment("Init callbacks");
-            for (_, xname) in func_types {
+            for (name, _func) in callbacks {
                 coder.line(format!("{sep} _{name} = Pointer.fromFunction({name}_)",
-                                   name = xname, sep = if initial { ':' } else { ',' }));
+                                   name = name,
+                                   sep = if initial { ':' } else { ',' }));
                 if initial { initial = false; }
             }
+
+            coder.comment("Init functions");            
+            for (name, func) in calls {
+                coder.line(format!("{sep} _{name} = dylib.lookup<NativeFunction<{type}>>('{ffi_name}').asFunction()",
+                                   type = func.cffi,
+                                   name = name,
+                                   ffi_name = func.name.as_ref().unwrap(),
+                                   sep = if initial { ':' } else { ',' }));
+                if initial { initial = false; }
+            }
+            
             coder.line("{}");
         });
+    }
+
+    fn parse_function(&mut self, name: &str, entity: Entity) {
+        info!("Parse function: `{}`", name);
+
+        let res = entity.get_result_type().unwrap();
+        let args = entity.get_arguments().unwrap();
+
+        let xname = self.make_name(name);
+
+        self.parse_type(res);
+
+        let mut num = 0;
+        
+        for arg in args {
+            use TypeKind::*;
+            
+            let type_ = arg.get_type().unwrap().get_canonical_type();
+
+            if type_.get_kind() == Pointer {
+                let type_ = type_.get_pointee_type().unwrap();
+
+                match type_.get_kind() {
+                    FunctionPrototype | FunctionNoPrototype => {
+                        let name = arg.get_name().unwrap_or_else(|| {
+                            let res = format!("cb{}", num);
+                            num += 1;
+                            res
+                        });
+                        
+                        let xname = format!("{fn_name}_{arg_name}",
+                                            fn_name = xname,
+                                            arg_name = name);
+                        self.callbacks.insert(xname, FuncDef::from(type_));
+                        continue;
+                    }
+                    _ => {}
+                }
+            }
+                    
+            self.parse_type(type_);
+        }
+
+        self.calls.insert(xname, FuncDef::from(entity));
+    }
+
+    fn parse_type<'a>(&mut self, type_: Type<'a>) {
+        use TypeKind::*;
+        use EntityKind::*;
+        
+        match type_.get_kind() {
+            Pointer => self.parse_type(type_.get_pointee_type().unwrap()),
+            _ => if let Some(entity) = type_.get_declaration() {
+                if let Some(name) = entity.get_name() {
+                    let xname = self.make_name(&name);
+                    if !self.exported.contains(&name) {
+                        match entity.get_kind() {
+                            EnumDecl => self.translate_enum(&name, &xname, entity),
+                            StructDecl => self.translate_struct(&name, &xname, entity),
+                            TypedefDecl => if !self.translate_typedef(&name, &xname, entity) {
+                                return;
+                            }
+                            _ => {
+                                warn!("Unparsed typedecl: {:?}", entity);
+                                return;
+                            }
+                        }
+                        self.exported.insert(name);
+                    }
+                }
+            }
+        }
     }
 
     pub fn coder(&self) -> &Coder {
@@ -94,11 +264,11 @@ impl Translator {
     }
 
     fn match_name(&self, name: impl AsRef<str>) -> bool {
-        self.options.match_.is_match(name.as_ref())
+        self.options.names_match.is_match(name.as_ref())
     }
 
     fn make_name(&self, name: impl AsRef<str>) -> String {
-        self.options.match_.replace(name.as_ref(), &self.options.replace as &str).into()
+        self.options.names_match.replace(name.as_ref(), &self.options.names_replace as &str).into()
     }
 
     fn export_once(&mut self, name: impl AsRef<str>) -> bool {
@@ -168,7 +338,7 @@ impl Translator {
         });
     }
 
-    fn translate_typedef(&mut self, name: &str, xname: &str, entity: Entity) {
+    fn translate_typedef(&mut self, name: &str, xname: &str, entity: Entity) -> bool {
         use TypeKind::*;
         
         let type_ = entity.get_typedef_underlying_type().unwrap();
@@ -187,7 +357,7 @@ impl Translator {
                         Self::translate_field(coder, field);
                     }
                 });
-            },
+            }/*,
             Pointer => {
                 let type_ = type_.get_pointee_type().unwrap();
                 match type_.get_kind() {
@@ -212,87 +382,68 @@ impl Translator {
                     },
                     _ => {},
                 }
-            },
-            _ => warn!("Untranslated typedef {:?}: `{}` as `{}`", type_, name, xname),
-        }
-    }
-
-    fn translate_function(&mut self, name: &str, xname: &str, entity: Entity) {
-        info!("Translate function: `{}` as `{}`", name, xname);
-
-        let res = entity.get_result_type().unwrap();
-        let args = entity.get_arguments().unwrap();
-        
-        if let Some(cmt) = entity.get_comment() {
-            self.coder.comment(cmt);
-        }
-        self.coder.line(format!("typedef {name}_ = {res} Function({args});",
-                                name = xname,
-                                res = self.translate_type(res, true),
-                                args = self.translate_args(args.clone(), true)));
-        self.coder.line(format!("typedef {name} = {res} Function({args});",
-                                name = xname,
-                                res = self.translate_type(res, false),
-                                args = self.translate_args(args, false)));
-        self.funcs.insert(name.into(), xname.into());
-    }
-
-    fn translate_type(&self, type_: Type<'_>, ffi: bool) -> Cow<'static, str> {
-        use TypeKind::*;
-
-        let canonical_type = type_.get_canonical_type();
-
-        debug!("Translate type: {:?} canonical: {:?}", type_, canonical_type);
-
-        let kind = canonical_type.get_kind();
-
-        if let Some(type_) = if ffi { cffi_type(kind) } else { dart_type(kind) } {
-            return type_.into();
-        }
-        
-        match kind {
-            Pointer => {
-                if let Some(type_) = type_.get_pointee_type() {
-                    format!("Pointer<{}>", self.translate_type(type_, ffi)).into()
-                } else {
-                    let name = type_.get_declaration().unwrap().get_name().unwrap();
-                    if self.func_types.contains_key(&name) {
-                        let xname = self.make_name(&name);
-                        format!("Pointer<NativeFunction<{}>>", xname).into()
-                    } else {
-                        error!("Unsupported pointer type: {:?}", type_);
-                        format!("<unsupported_pointer:{}>", name).into()
-                    }
-                }
-            },
-            Record => {
-                let decl = type_.get_declaration().unwrap();
-                decl.get_name().unwrap().into()
-            },
-            kind => {
-                error!("Unsupported type kind: {:?}", kind);
-                format!("<unsupported_type_kind:{:?}>", kind).into()
-            },
-        }
-    }
-
-    fn translate_types<'a>(&self, types: impl IntoIterator<Item = Type<'a>>, ffi: bool) -> String {
-        types.into_iter().map(|type_| self.translate_type(type_, ffi))
-            .collect::<Vec<_>>().join(", ")
-    }
-
-    fn translate_args<'a>(&self, args: impl IntoIterator<Item = Entity<'a>>, ffi: bool) -> String {
-        args.into_iter().map(|arg| {
-            let type_ = arg.get_type().unwrap();
-            let type_ = self.translate_type(type_, ffi);
-            
-            if let Some(name) = arg.get_name() {
-                format!("{type} {name}", type = type_, name = name).into()
-            } else {
-                type_
+            },*/
+            _ => {
+                warn!("Untranslated typedef {:?}: `{}` as `{}`", type_, name, xname);
+                return false;
             }
-        }).collect::<Vec<_>>().join(", ")
+        }
+
+        true
     }
+}
+
+fn translate_type(type_: Type<'_>, ffi: bool) -> Cow<'static, str> {
+    use TypeKind::*;
+
+    let canonical_type = type_.get_canonical_type();
+    
+    debug!("Translate type: {:?} canonical: {:?}", type_, canonical_type);
+    
+    let kind = canonical_type.get_kind();
+    
+    if let Some(type_) = if ffi { cffi_type(kind) } else { dart_type(kind) } {
+        return type_.into();
+    }
+    
+    match kind {
+        Pointer => {
+            let type_ = type_.get_pointee_type()
+                .or_else(|| canonical_type.get_pointee_type())
+                .unwrap();
+            format!("Pointer<{}>", translate_type(type_, true)).into()
+        }
+        Record => {
+            let decl = type_.get_declaration().unwrap();
+            decl.get_name().unwrap().into()
+        }
+        FunctionPrototype | FunctionNoPrototype => {
+            let cb = FuncDef::from(canonical_type);
+            format!("NativeFunction<{}>", cb.cffi).into()
+        }
+        kind => {
+            error!("Unsupported type kind: {:?}", kind);
+            format!("<unsupported_type_kind:{:?}>", kind).into()
+        }
+    }
+}
+
+fn translate_types<'a>(types: impl IntoIterator<Item = Type<'a>>, ffi: bool) -> String {
+    types.into_iter().map(|type_| translate_type(type_, ffi))
+        .collect::<Vec<_>>().join(", ")
+}
+
+fn translate_args<'a>(args: impl IntoIterator<Item = Entity<'a>>, ffi: bool) -> String {
+    args.into_iter().map(|arg| {
+        let type_ = arg.get_type().unwrap();
+        let type_ = translate_type(type_, ffi);
+        
+        if let Some(name) = arg.get_name() {
+            format!("{type} {name}", type = type_, name = name).into()
+        } else {
+            type_
+        }
+    }).collect::<Vec<_>>().join(", ")
 }
 
 fn without_prefix(src: impl AsRef<str>, pfx: impl AsRef<str>) -> String {
@@ -358,45 +509,7 @@ fn dart_type(type_kind: TypeKind) -> Option<&'static str> {
         Short | UShort |
         Int | UInt |
         Long | ULong => "int".into(),
-        Float => "float".into(),
-        Double => "double".into(),
+        Float | Double => "double".into(),
         _ => return None,
     })
 }
-
-/*fn cffi_type(type_: impl AsRef<str>) -> Option<&'static str> {
-    Some(match type_.as_ref() {
-        "char" | "signed char" => "Int8",
-        "unsigned char" => "Uint8",
-        "short" | "signed short" => "Int16",
-        "unsigned short" => "Uint16",
-        "int" | "signed int" => "Int32",
-        "unsigned int" => "Uint32",
-        "long" | "signed long" => "Int32",
-        "unsigned long" => "Uint32",
-        "long long" | "signed long long" => "Int64",
-        "unsigned long long" => "Uint64",
-        "float" => "Float",
-        "double" => "Double",
-        
-        "int8_t" => "Int8",
-        "uint8_t" => "Uint8",
-        "int16_t" => "Int16",
-        "uint16_t" => "Uint16",
-        "int32_t" => "Int32",
-        "uint32_t" => "Uint32",
-        "int64_t" => "Int64",
-        "uint64_t" => "Uint64",
-
-        "__int8_t" => "Int8",
-        "__uint8_t" => "Uint8",
-        "__int16_t" => "Int16",
-        "__uint16_t" => "Uint16",
-        "__int32_t" => "Int32",
-        "__uint32_t" => "Uint32",
-        "__int64_t" => "Int64",
-        "__uint64_t" => "Uint64",
-
-        _ => return None,
-    })
-}*/
