@@ -12,19 +12,19 @@ pub struct FuncDef {
     dart: String,
 }
 
-impl<'a> From<Entity<'a>> for FuncDef {
-    fn from(entity: Entity) -> Self {
+impl FuncDef {
+    fn from_entity(typenames: &HashMap<String, String>, entity: Entity) -> Self {
         let res = entity.get_result_type();
         let args = entity.get_arguments();
 
-        let cffi_res = res.map(|type_| translate_type(type_, true))
+        let cffi_res = res.map(|type_| translate_type(typenames, type_, true))
             .unwrap_or("Void".into());
-        let dart_res = res.map(|type_| translate_type(type_, false))
+        let dart_res = res.map(|type_| translate_type(typenames, type_, false))
             .unwrap_or("void".into());
 
-        let cffi_args = args.as_ref().map(|args| translate_args(args.clone(), true))
+        let cffi_args = args.as_ref().map(|args| translate_args(typenames, args.clone(), true))
             .unwrap_or("".into());
-        let dart_args = args.map(|args| translate_args(args, false))
+        let dart_args = args.map(|args| translate_args(typenames, args, false))
             .unwrap_or("".into());
         
         Self {
@@ -38,21 +38,19 @@ impl<'a> From<Entity<'a>> for FuncDef {
                           args = dart_args),
         }
     }
-}
-
-impl<'a> From<Type<'a>> for FuncDef {
-    fn from(type_: Type<'a>) -> Self {
+    
+    fn from_type<'a>(typenames: &HashMap<String, String>, type_: Type<'a>) -> Self {
         let res = type_.get_result_type();
         let args = type_.get_argument_types();
 
-        let cffi_res = res.map(|type_| translate_type(type_, true))
+        let cffi_res = res.map(|type_| translate_type(typenames, type_, true))
             .unwrap_or("Void".into());
-        let dart_res = res.map(|type_| translate_type(type_, false))
+        let dart_res = res.map(|type_| translate_type(typenames, type_, false))
             .unwrap_or("void".into());
 
-        let cffi_args = args.as_ref().map(|args| translate_types(args.clone(), true))
+        let cffi_args = args.as_ref().map(|args| translate_types(typenames, args.clone(), true))
             .unwrap_or("".into());
-        let dart_args = args.map(|args| translate_types(args, false))
+        let dart_args = args.map(|args| translate_types(typenames, args, false))
             .unwrap_or("".into());
         
         Self {
@@ -73,9 +71,10 @@ pub struct Translator {
     options: Options,
 
     exported: HashSet<String>,
+    typenames: HashMap<String, String>,
     
-    calls: HashMap<String, FuncDef>,
-    callbacks: HashMap<String, FuncDef>,
+    calls: Vec<(String, FuncDef)>,
+    callbacks: Vec<(String, FuncDef)>,
     
     coder: Coder,
 }
@@ -85,8 +84,9 @@ impl Translator {
         Self {
             options,
             exported: HashSet::default(),
-            calls: HashMap::default(),
-            callbacks: HashMap::default(),
+            typenames: HashMap::default(),
+            calls: Vec::default(),
+            callbacks: Vec::default(),
             coder: Coder::default(),
         }
     }
@@ -155,9 +155,11 @@ impl Translator {
             coder.line(format!("{name}(", name = class));
             coder.line("    DynamicLibrary dylib");
             
-            for (name, func) in callbacks {
-                coder.line(format!("  , {type} {name}_",
+            for (name, _func) in callbacks {
+                /*coder.line(format!("  , {type} {name}_",
                                    type = func.dart,
+                                   name = name));*/
+                coder.line(format!("  , this._{name}",
                                    name = name));
             }
             
@@ -165,13 +167,13 @@ impl Translator {
 
             let mut initial = true;
 
-            coder.comment("Init callbacks");
+            /*coder.comment("Init callbacks");
             for (name, _func) in callbacks {
                 coder.line(format!("{sep} _{name} = Pointer.fromFunction({name}_)",
                                    name = name,
                                    sep = if initial { ':' } else { ',' }));
                 if initial { initial = false; }
-            }
+            }*/
 
             coder.comment("Init functions");            
             for (name, func) in calls {
@@ -202,10 +204,11 @@ impl Translator {
         for arg in args {
             use TypeKind::*;
             
-            let type_ = arg.get_type().unwrap().get_canonical_type();
+            let type_ = arg.get_type().unwrap();
+            let canonical_type = type_.get_canonical_type();
 
-            if type_.get_kind() == Pointer {
-                let type_ = type_.get_pointee_type().unwrap();
+            if canonical_type.get_kind() == Pointer {
+                let type_ = canonical_type.get_pointee_type().unwrap();
 
                 match type_.get_kind() {
                     FunctionPrototype | FunctionNoPrototype => {
@@ -218,7 +221,7 @@ impl Translator {
                         let xname = format!("{fn_name}_{arg_name}",
                                             fn_name = xname,
                                             arg_name = name);
-                        self.callbacks.insert(xname, FuncDef::from(type_));
+                        self.callbacks.push((xname, FuncDef::from_type(&self.typenames, type_)));
                         continue;
                     }
                     _ => {}
@@ -228,7 +231,7 @@ impl Translator {
             self.parse_type(type_);
         }
 
-        self.calls.insert(xname, FuncDef::from(entity));
+        self.calls.push((xname, FuncDef::from_entity(&self.typenames, entity)));
     }
 
     fn parse_type<'a>(&mut self, type_: Type<'a>) {
@@ -238,6 +241,7 @@ impl Translator {
         match type_.get_kind() {
             Pointer => self.parse_type(type_.get_pointee_type().unwrap()),
             _ => if let Some(entity) = type_.get_declaration() {
+                trace!("parse type: {:?}", entity);
                 if let Some(name) = entity.get_name() {
                     let xname = self.make_name(&name);
                     if !self.exported.contains(&name) {
@@ -245,6 +249,7 @@ impl Translator {
                             EnumDecl => self.translate_enum(&name, &xname, entity),
                             StructDecl => self.translate_struct(&name, &xname, entity),
                             TypedefDecl => if !self.translate_typedef(&name, &xname, entity) {
+                                warn!("Unparsed typedef: {:?}", entity);
                                 return;
                             }
                             _ => {
@@ -252,7 +257,8 @@ impl Translator {
                                 return;
                             }
                         }
-                        self.exported.insert(name);
+                        self.exported.insert(name.clone());
+                        self.typenames.insert(name, xname);
                     }
                 }
             }
@@ -357,32 +363,7 @@ impl Translator {
                         Self::translate_field(coder, field);
                     }
                 });
-            }/*,
-            Pointer => {
-                let type_ = type_.get_pointee_type().unwrap();
-                match type_.get_kind() {
-                    FunctionPrototype => {
-                        info!("Translate typedef function pointer: `{}` as `{}`", name, xname);
-                        
-                        let res = type_.get_result_type().unwrap();
-                        let args = type_.get_argument_types().unwrap();
-
-                        if let Some(cmt) = entity.get_comment() {
-                            self.coder.comment(cmt);
-                        }
-                        self.coder.line(format!("typedef {name}_ = {res} Function({args});",
-                                                name = xname,
-                                                res = self.translate_type(res, true),
-                                                args = self.translate_types(args.clone(), true)));
-                        self.coder.line(format!("typedef {name} = {res} Function({args});",
-                                                name = xname,
-                                                res = self.translate_type(res, false),
-                                                args = self.translate_types(args, false)));
-                        self.func_types.insert(name.into(), xname.into());
-                    },
-                    _ => {},
-                }
-            },*/
+            }
             _ => {
                 warn!("Untranslated typedef {:?}: `{}` as `{}`", type_, name, xname);
                 return false;
@@ -393,7 +374,7 @@ impl Translator {
     }
 }
 
-fn translate_type(type_: Type<'_>, ffi: bool) -> Cow<'static, str> {
+fn translate_type(typenames: &HashMap<String, String>, type_: Type<'_>, ffi: bool) -> Cow<'static, str> {
     use TypeKind::*;
 
     let canonical_type = type_.get_canonical_type();
@@ -411,14 +392,20 @@ fn translate_type(type_: Type<'_>, ffi: bool) -> Cow<'static, str> {
             let type_ = type_.get_pointee_type()
                 .or_else(|| canonical_type.get_pointee_type())
                 .unwrap();
-            format!("Pointer<{}>", translate_type(type_, true)).into()
+            format!("Pointer<{}>", translate_type(typenames, type_, true)).into()
         }
         Record => {
             let decl = type_.get_declaration().unwrap();
-            decl.get_name().unwrap().into()
+            let name = decl.get_name().unwrap();
+
+            if let Some(name) = typenames.get(&name) {
+                name.clone().into()
+            } else {
+                name.into()
+            }
         }
         FunctionPrototype | FunctionNoPrototype => {
-            let cb = FuncDef::from(canonical_type);
+            let cb = FuncDef::from_type(typenames, canonical_type);
             format!("NativeFunction<{}>", cb.cffi).into()
         }
         kind => {
@@ -428,15 +415,15 @@ fn translate_type(type_: Type<'_>, ffi: bool) -> Cow<'static, str> {
     }
 }
 
-fn translate_types<'a>(types: impl IntoIterator<Item = Type<'a>>, ffi: bool) -> String {
-    types.into_iter().map(|type_| translate_type(type_, ffi))
+fn translate_types<'a>(typenames: &HashMap<String, String>, types: impl IntoIterator<Item = Type<'a>>, ffi: bool) -> String {
+    types.into_iter().map(|type_| translate_type(typenames, type_, ffi))
         .collect::<Vec<_>>().join(", ")
 }
 
-fn translate_args<'a>(args: impl IntoIterator<Item = Entity<'a>>, ffi: bool) -> String {
+fn translate_args<'a>(typenames: &HashMap<String, String>, args: impl IntoIterator<Item = Entity<'a>>, ffi: bool) -> String {
     args.into_iter().map(|arg| {
         let type_ = arg.get_type().unwrap();
-        let type_ = translate_type(type_, ffi);
+        let type_ = translate_type(typenames, type_, ffi);
         
         if let Some(name) = arg.get_name() {
             format!("{type} {name}", type = type_, name = name).into()
