@@ -135,7 +135,7 @@ impl Translator {
                 if let Some(cmt) = &func.cmt {
                     coder.comment(cmt);
                 }
-                coder.line(format!("final Pointer<NativeFunction<{type}>> _{name};",
+                coder.line(format!("final Pointer<NativeFunction<{type}>> {name};",
                                    type = func.cffi,
                                    name = name));
             }
@@ -146,7 +146,7 @@ impl Translator {
                 if let Some(cmt) = &func.cmt {
                     coder.comment(cmt);
                 }
-                coder.line(format!("final {type} _{name};",
+                coder.line(format!("final {type} {name};",
                                    type = func.dart,
                                    name = name));
             }
@@ -156,10 +156,7 @@ impl Translator {
             coder.line("    DynamicLibrary dylib");
             
             for (name, _func) in callbacks {
-                /*coder.line(format!("  , {type} {name}_",
-                                   type = func.dart,
-                                   name = name));*/
-                coder.line(format!("  , this._{name}",
+                coder.line(format!("  , this.{name}",
                                    name = name));
             }
             
@@ -167,17 +164,9 @@ impl Translator {
 
             let mut initial = true;
 
-            /*coder.comment("Init callbacks");
-            for (name, _func) in callbacks {
-                coder.line(format!("{sep} _{name} = Pointer.fromFunction({name}_)",
-                                   name = name,
-                                   sep = if initial { ':' } else { ',' }));
-                if initial { initial = false; }
-            }*/
-
             coder.comment("Init functions");            
             for (name, func) in calls {
-                coder.line(format!("{sep} _{name} = dylib.lookup<NativeFunction<{type}>>('{ffi_name}').asFunction()",
+                coder.line(format!("{sep} {name} = dylib.lookup<NativeFunction<{type}>>('{ffi_name}').asFunction()",
                                    type = func.cffi,
                                    name = name,
                                    ffi_name = func.name.as_ref().unwrap(),
